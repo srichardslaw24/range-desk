@@ -1,0 +1,47 @@
+name: Daily Range Scan
+
+# When this runs.
+on:
+  schedule:
+    # GitHub cron is in UTC. 21:30 UTC = 5:30 PM EDT (after the 4 PM ET close).
+    # In winter (EST, UTC-5) this is 4:30 PM ET — still fine, still after close.
+    # Note: GitHub's scheduler can lag by a few to ~15 minutes under load. That's OK
+    # for end-of-day data; the bars are already final.
+    - cron: "30 21 * * 1-5"   # Mon–Fri only
+  workflow_dispatch: {}        # also lets you run it manually from the Actions tab
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Don't let two runs publish at once.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  scan-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install yfinance pandas
+
+      - name: Run the scan (writes index.html)
+        run: python scan_to_html.py
+
+      - name: Upload the page
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .            # the folder containing index.html
+
+      - name: Publish to GitHub Pages
+        uses: actions/deploy-pages@v4
