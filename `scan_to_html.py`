@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+Range Desk — daily scanner (web edition)
+========================================
+Same scoring engine as range_scanner.py, but instead of printing to a terminal
+it writes an index.html page. Designed to run unattended on GitHub Actions once
+a day and publish to GitHub Pages.
+
+Run locally to preview:   python3 scan_to_html.py
+Output:                   index.html  (+ scan_results.csv)
+
+The scoring logic is UNCHANGED and already tested. Only the output layer is new.
+"""
+
+import sys
+import csv
+import html
+from datetime import datetime, timezone, timedelta
+
+# ----------------------------------------------------------------------------
+# CONFIG — edit your watchlist here. Keep it to stocks that actually RANGE.
+# (Wide-swinging names like CSCO/IBM aren't range trades — leave them out.)
+# ----------------------------------------------------------------------------
+WATCHLIST = [
+    "KO", "PG", "JNJ", "PEP", "MRK", "WMT", "MCD", "VZ", "ABT", "CVX", "XOM", "T", "APPL", "VST", "NBIS", "SNDK", "INTC", "LAC", "AVGO", "AMZN", "SPX", " XSP", "NDX", "NVDA", "GOOGL", 
+]
+
+LOOKBACK_DAYS = 60
+VOL_AVG_DAYS  = 20
+SUPPORT_ZONE  = 0.20
+SPIKE_RATIO   = 1.50
+SOME_VOL      = 1.20
+MIN_RANGE_PCT = 4.0
+WIDE_RANGE_PCT = 25.0
+
+OUTPUT_HTML = "index.html"
+OUTPUT_CSV  = "scan_results.csv"
+EASTERN_OFFSET = -4  # ET is UTC-4 in summer (EDT); use -5 in winter if you care
+
+
+# ----------------------------------------------------------------------------
+# DATA LAYER — swap this one function to change providers
+# ----------------------------------------------------------------------------
+def fetch_bars(tickers, lookback_days):
+    import yfinance as yf
+    period_days = int(lookback_days * 1.6) + 10
+    raw = yf.download(tickers, period=f"{period_days}d", interval="1d",
+                      group_by="ticker", auto_adjust=True, progress=False, threads=True)
+    out = {}
+    if len(tickers) == 1:
+        t = tickers[0]
+        if not raw.empty:
+            out[t] = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    else:
+        for t in tickers:
+            try:
+                sub = raw[t][["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if not sub.empty:
+                    out[t] = sub
+            except Exception:
+                continue
+    return out
+
+
+# ----------------------------------------------------------------------------
+# SCORING ENGINE — identical to the tested terminal version
+# ----------------------------------------------------------------------------
+class Scan:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def score(ticker, price, range_high, range_low, volume, avg_volume):
+    width = range_high - range_low
+    range_pct = width / range_low * 100 if range_low else 0
+    pos = (price - range_low) / width if width else 0.5
+    vol_ratio = volume / avg_volume if avg_volume else 0
+
+    support_score = (1 - pos / SUPPORT_ZONE) if pos < SUPPORT_ZONE else 0
+    support_score = max(0.0, min(1.0, support_score))
+
+    if range_pct < MIN_RANGE_PCT:
+        rq = range_pct / MIN_RANGE_PCT * 0.5
+    elif range_pct <= 12:
+        rq = 1.0
+    elif range_pct <= WIDE_RANGE_PCT:
+        rq = 1 - (range_pct - 12) / (WIDE_RANGE_PCT - 12) * 0.6
+    else:
+        rq = 0.3
+
+    below_floor = price < range_low
+    at_support = pos <= SUPPORT_ZONE + 1e-9 and not below_floor
+    spike = vol_ratio >= SPIKE_RATIO
+    some_vol = vol_ratio >= SOME_VOL
+
+    if below_floor and some_vol:
+        verdict = "Breakdown risk"
+        why = (f"Closed BELOW the floor (${range_low:.2f}) on elevated volume "
+               f"({vol_ratio:.1f}x). The same volume that defends support reads as "
+               f"sellers winning once price is below it. Not a buy.")
+    elif at_support and spike:
+        verdict = "Bounce candidate"
+        why = (f"In the bottom {pos*100:.0f}% of range, still above the floor, with a "
+               f"{vol_ratio:.1f}x volume spike. Buyers MAY be defending support. "
+               f"Confirm with a rejection/engulfing candle before acting.")
+    elif at_support and not spike:
+        verdict = "Watch"
+        why = (f"At support (bottom {pos*100:.0f}%) but volume only {vol_ratio:.1f}x avg. "
+               f"Nothing defending the floor yet. A bounce without volume is weak.")
+    elif below_floor:
+        verdict = "Breakdown risk"
+        why = (f"Below the floor (${range_low:.2f}) on light volume ({vol_ratio:.1f}x). "
+               f"No longer a range-bottom buy; the range may be broken.")
+    else:
+        verdict = "No setup"
+        extra = (f" Range is also tight ({range_pct:.1f}%), likely too small after costs."
+                 if range_pct < MIN_RANGE_PCT else " Wait for a pullback toward the floor.")
+        why = f"Price at {pos*100:.0f}% of range — not near support.{extra}"
+
+    return Scan(ticker=ticker, price=price, range_high=range_high, range_low=range_low,
+                volume=volume, avg_volume=avg_volume, pos=max(0, min(1, pos)),
+                range_pct=range_pct, vol_ratio=vol_ratio, support_score=support_score,
+                range_quality=rq, verdict=verdict, why=why)
+
+
+def scan_from_bars(ticker, df):
+    if df is None or len(df) < VOL_AVG_DAYS + 2:
+        return None
+    today = df.iloc[-1]
+    prior = df.iloc[:-1]
+    window = prior.tail(LOOKBACK_DAYS)
+    return score(ticker, float(today["Close"]), float(window["High"].max()),
+                 float(window["Low"].min()), float(today["Volume"]),
+                 float(prior["Volume"].tail(VOL_AVG_DAYS).mean()))
+
+
+VERDICT_ORDER = {"Bounce candidate": 0, "Watch": 1, "No setup": 2, "Breakdown risk": 3}
+
+
+# ----------------------------------------------------------------------------
+# HTML OUTPUT
+# ----------------------------------------------------------------------------
+def build_html(results, error=None, last_bar_date=None):
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc + timedelta(hours=EASTERN_OFFSET)
+    stamp = now_et.strftime("%a %b %d, %Y · %I:%M %p ET")
+
+    vcolors = {
+        "Bounce candidate": ("#26a269", "#13301f"),
+        "Watch": ("#e8b13a", "#362a10"),
+        "Breakdown risk": ("#d65745", "#341c19"),
+        "No setup": ("#8a96a6", "#1b222b"),
+    }
+
+    if error:
+        body = f"""<div class="error">
+          <strong>Scan failed.</strong> The data fetch didn't complete, so these
+          results may be missing or stale. yfinance is unofficial and can break
+          when Yahoo changes its API.<br><br><code>{html.escape(str(error))}</code>
+        </div>"""
+        counts_line = "scan did not complete"
+    else:
+        results = [r for r in results if r]
+        results.sort(key=lambda r: (VERDICT_ORDER.get(r.verdict, 9), -r.support_score))
+        bounce = sum(1 for r in results if r.verdict == "Bounce candidate")
+        watch = sum(1 for r in results if r.verdict == "Watch")
+        brk = sum(1 for r in results if r.verdict == "Breakdown risk")
+        counts_line = f"{bounce} bounce candidate · {watch} watch · {brk} breakdown risk"
+
+        cards = []
+        for r in results:
+            fg, bg = vcolors.get(r.verdict, ("#8a96a6", "#1b222b"))
+            posLeft = max(1, min(98, r.pos * 100))
+            cards.append(f"""
+            <div class="stock">
+              <div class="head">
+                <div><span class="tkr">{html.escape(r.ticker)}</span>
+                <span class="px">${r.price:.2f}</span></div>
+                <span class="verdict" style="color:{fg};background:{bg};border-color:{fg}">{r.verdict}</span>
+              </div>
+              <div class="rangeviz">
+                <div class="zone"></div><div class="zonetop"></div>
+                <div class="price" style="left:{posLeft}%"></div>
+                <span class="lab l">floor ${r.range_low:.2f}</span>
+                <span class="lab r">ceiling ${r.range_high:.2f}</span>
+              </div>
+              <div class="stats">
+                <span>pos <b>{r.pos*100:.0f}%</b></span>
+                <span>vol <b style="color:{'#26a269' if r.vol_ratio>=1.5 else ('#e8b13a' if r.vol_ratio>=1.2 else '#8a96a6')}">{r.vol_ratio:.2f}×</b></span>
+                <span>range <b>{r.range_pct:.1f}%</b></span>
+              </div>
+              <div class="why">{html.escape(r.why)}</div>
+            </div>""")
+        body = '<div class="scan">' + "".join(cards) + "</div>"
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Range Desk · daily scan</title>
+<style>
+  :root{{--bg:#0d1015;--panel:#151a21;--panel2:#1b222b;--ink:#e8edf2;--muted:#8a96a6;--line:#283341;--accent:#e8b13a;}}
+  *{{box-sizing:border-box;}} body{{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;line-height:1.5;}}
+  .wrap{{max-width:760px;margin:0 auto;padding:22px 16px 70px;}}
+  header{{border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:8px;}}
+  h1{{font-size:20px;margin:0;font-weight:700;}} h1 .d{{color:var(--accent);}}
+  .stamp{{font-size:12.5px;color:var(--muted);margin-top:4px;}}
+  .counts{{font-size:13px;color:var(--ink);margin-top:6px;font-weight:600;}}
+  .note{{font-size:11.5px;color:#6b7685;background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:9px 12px;margin:14px 0 18px;line-height:1.45;}}
+  .error{{background:#341c19;border:1px solid #d65745;color:#f0a298;border-radius:10px;
+    padding:14px 16px;margin:16px 0;font-size:13.5px;line-height:1.5;}}
+  .error code{{font-size:11.5px;color:#e8edf2;word-break:break-all;}}
+  .scan{{display:grid;gap:12px;}}
+  .stock{{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px;}}
+  .head{{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;}}
+  .tkr{{font-size:17px;font-weight:700;}} .px{{font-size:13px;color:var(--muted);}}
+  .verdict{{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+    padding:4px 10px;border-radius:20px;border:1px solid;}}
+  .rangeviz{{height:32px;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+    position:relative;margin-bottom:10px;overflow:hidden;}}
+  .zone{{position:absolute;inset:0 auto 0 0;width:20%;background:#13301f;border-right:1px dashed #26a269;}}
+  .zonetop{{position:absolute;inset:0 0 0 auto;width:20%;background:#341c19;border-left:1px dashed #d65745;}}
+  .price{{position:absolute;top:-3px;bottom:-3px;width:3px;background:var(--ink);border-radius:2px;}}
+  .lab{{position:absolute;font-size:10px;color:var(--muted);bottom:2px;}}
+  .lab.l{{left:6px;}} .lab.r{{right:6px;}}
+  .stats{{display:flex;gap:16px;font-size:12.5px;color:var(--muted);margin-bottom:10px;font-variant-numeric:tabular-nums;}}
+  .stats b{{color:var(--ink);}}
+  .why{{font-size:12.5px;color:var(--muted);border-top:1px solid var(--line);padding-top:10px;}}
+  footer{{margin-top:24px;font-size:11px;color:#5b6675;text-align:center;line-height:1.5;}}
+</style></head><body><div class="wrap">
+  <header>
+    <h1>Range Desk<span class="d">.</span></h1>
+    <div class="stamp">Data as of {last_bar_date or '—'} · page built {stamp}</div>
+    <div class="counts">{counts_line}</div>
+  </header>
+  <div class="note">
+    Verdicts are situations to research, not buy signals. A volume spike at support is
+    ambiguous by design — it can be buyers defending the floor or sellers breaking it.
+    This page never tells you to buy. Educational only; not financial advice.
+  </div>
+  {body}
+  <footer>
+    Auto-generated daily from Yahoo Finance daily bars (via yfinance, unofficial).
+    If "Data as of" is not the last trading day, the fetch may have failed — treat as stale.
+  </footer>
+</div></body></html>"""
+
+
+def write_csv(results, path):
+    results = [r for r in results if r]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ticker", "price", "range_low", "range_high", "range_pct",
+                    "pos_pct", "vol_ratio", "verdict"])
+        for r in sorted(results, key=lambda r: (VERDICT_ORDER.get(r.verdict, 9), -r.support_score)):
+            w.writerow([r.ticker, f"{r.price:.2f}", f"{r.range_low:.2f}", f"{r.range_high:.2f}",
+                        f"{r.range_pct:.1f}", f"{r.pos*100:.0f}", f"{r.vol_ratio:.2f}", r.verdict])
+
+
+def main():
+    tickers = sys.argv[1:] if len(sys.argv) > 1 else WATCHLIST
+    error = None
+    results = []
+    last_bar_date = None
+    try:
+        bars = fetch_bars(tickers, LOOKBACK_DAYS)
+        if not bars:
+            raise RuntimeError("No data returned for any ticker.")
+        results = [scan_from_bars(t, bars.get(t)) for t in tickers]
+        # find the most recent bar date across all frames, for the staleness stamp
+        for df in bars.values():
+            d = df.index[-1]
+            ds = d.strftime("%a %b %d, %Y")
+            last_bar_date = ds  # last writer wins; they should all match
+    except Exception as e:
+        error = e
+        print(f"Scan error: {e}", file=sys.stderr)
+
+    with open(OUTPUT_HTML, "w") as f:
+        f.write(build_html(results, error=error, last_bar_date=last_bar_date))
+    if not error:
+        write_csv(results, OUTPUT_CSV)
+    print(f"Wrote {OUTPUT_HTML}" + ("" if error else f" and {OUTPUT_CSV}"))
+    # exit non-zero on failure so GitHub Actions marks the run as failed (you'll get an email)
+    sys.exit(1 if error else 0)
+
+
+if __name__ == "__main__":
+    main()
